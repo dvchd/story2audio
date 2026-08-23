@@ -4,7 +4,28 @@ Dưới đây là tài liệu tổng hợp lại toàn bộ các tính năng, c�
 
 ---
 
-## [v3.0.0] - Bản cập nhật Phụ đề Trực tiếp & Redesign Giao diện (Mới nhất)
+## [v3.2.0] - Chunk cues cho Google TTS (tự cuộn theo đoạn)
+
+### ✨ Tính năng mới
+
+- **Chunk cues cho Google TTS (gTTS):**
+  - gTTS không có `WordBoundary` nên mỗi cue = một chunk audio, với timing thật được đo từ duration MP3 của từng chunk (`mp3_duration_seconds`).
+  - Giới hạn chunk gTTS xuống `GTTS_HARD_MAX_CHUNK = 1200` ký tự để granularity tốt (client có thể nội suy vị trí theo số ký tự bên trong chunk).
+  - Tích hợp khongdich: độc giả nghe giọng Google (Nữ Miền Bắc) giờ được **tự cuộn tới đoạn đang đọc** như giọng Edge.
+
+- **Cờ khả năng `scroll_supported`:**
+  - Meta, `/tts/status`, `/tts/start`, `/tts/cues` và SSE stream trả thêm `scroll_supported` (true cho edge + gtts) tách biệt với `subtitle_supported` (chỉ edge) — karaoke phụ đề vẫn chỉ dành cho Edge, còn cues phục vụ auto-scroll có ở cả hai engine.
+
+- **Cache validity cho gTTS:**
+  - `is_cache_valid` thêm `require_cues` — cache gTTS cũ (sinh trước v3.2.0, không có cues) tự động bị coi là hết hạn và tái tạo lại ở lần nghe tiếp theo.
+
+- **Giới hạn dung lượng cache (`MAX_CACHE_MB`):**
+  - Env mới `MAX_CACHE_MB` (mặc định `20480` = 20 GB). Khi thư mục `audio_cache` vượt giới hạn, service tự động xóa các cache cũ nhất (theo mtime, xóa theo từng nhóm cache_id) tới khi về dưới 90% giới hạn.
+  - Chạy một lần lúc khởi động + sau mỗi lần tạo audio; bỏ qua các cache đang được tạo để không xóa file đang ghi.
+
+---
+
+## [v3.0.0] - Bản cập nhật Phụ đề Trực tiếp & Redesign Giao diện
 
 Bản cập nhật lớn tiếp theo mang đến tính năng **Phụ đề trực tiếp (Live Subtitles)** cho Edge TTS, redesign toàn bộ giao diện người dùng và cải tiến sâu kiến trúc backend.
 

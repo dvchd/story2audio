@@ -10,6 +10,7 @@ services:
     environment:
       TZ: Asia/Tokyo
       PYTHONUNBUFFERED: "1"
+      MAX_CACHE_MB: ${MAX_CACHE_MB:-20480}
     expose:
       - "8000"
     volumes:

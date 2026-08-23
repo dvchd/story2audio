@@ -8,6 +8,7 @@ import logging
 import hashlib
 import asyncio
 import unicodedata
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import List, Dict, AsyncGenerator, Optional, Tuple
 
@@ -45,7 +46,7 @@ if sys.platform == "win32":
 # ---------------------------------------------------------------------------
 # Directories & Setup
 # ---------------------------------------------------------------------------
-VERSION = os.environ.get("APP_VERSION", "v3.1.0")
+VERSION = os.environ.get("APP_VERSION", "v3.2.0")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -59,7 +60,23 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Story to Audio + Live Subtitles API")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Dọn cache một lần lúc khởi động (nếu vượt MAX_CACHE_MB từ lần chạy trước)
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(
+            None,
+            prune_cache_dir,
+            CACHE_DIR,
+            MAX_CACHE_MB * 1024 * 1024,
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Prune cache lúc khởi động thất bại: %s", exc)
+    yield
+
+
+app = FastAPI(title="Story to Audio + Live Subtitles API", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 logger = logging.getLogger("story2audio")
@@ -153,6 +170,11 @@ DEFAULT_MAX_SENTENCES_PER_CHUNK = [2, 4, 8, 15, 50]
 CJK_CHUNK_SIZES = [60, 150, 300, 800, 2000]
 CJK_HARD_MAX_CHUNK = 2000
 CJK_MAX_SENTENCES_PER_CHUNK = [2, 4, 8, 12, 30]
+
+# gTTS không có WordBoundary nên mỗi cue = cả một chunk. Giới hạn chunk
+# nhỏ hơn để "tự cuộn theo đoạn" có granularity tốt (client nội suy vị trí
+# theo số ký tự bên trong chunk). Cân bằng với số request gửi lên Google.
+GTTS_HARD_MAX_CHUNK = 1200
 
 MULTILANG_SENTENCE_RE = re.compile(
     r".+?(?:[.!?…。！？]+(?:[\"'”’»」』）】]*)|$)",
@@ -299,7 +321,90 @@ def remove_runtime_files_only(cache_id: str) -> None:
         )
 
 
-def is_cache_valid(cache_id: str, require_subtitles: bool = False) -> bool:
+# ---------------------------------------------------------------------------
+# Cache pruning — chặn bộ nhớ phình vô hạn
+# ---------------------------------------------------------------------------
+try:
+    MAX_CACHE_MB = int(os.environ.get("MAX_CACHE_MB", "20480"))  # mặc định 20 GB
+except ValueError:
+    MAX_CACHE_MB = 20480
+
+_CACHE_FILE_RE = re.compile(r"^([a-f0-9]{32})\.(mp3|json|srt|vtt|cues\.json|cues\.jsonl)$")
+
+
+def prune_cache_dir(
+    dir_path: str,
+    max_bytes: int,
+    target_bytes: Optional[int] = None,
+    skip_ids: Optional[set] = None,
+) -> int:
+    """Xóa các cache cũ nhất (theo mtime) khi tổng dung lượng vượt `max_bytes`.
+
+    - Mỗi cache_id là một nhóm file; mtime của nhóm = mtime cũ nhất trong nhóm.
+    - Xóa nhóm cũ nhất trước, tới khi tổng <= `target_bytes` (mặc định 90% max).
+    - Bỏ qua các cache_id đang được tạo (`skip_ids`) để không xóa file đang ghi.
+    - Trả về số byte đã giải phóng.
+    """
+    if max_bytes <= 0:
+        return 0
+    if target_bytes is None:
+        target_bytes = int(max_bytes * 0.9)
+    skip_ids = skip_ids or set()
+
+    entries = []
+    total = 0
+    try:
+        with os.scandir(dir_path) as it:
+            for e in it:
+                if not e.is_file(follow_symlinks=False):
+                    continue
+                m = _CACHE_FILE_RE.match(e.name)
+                if not m:
+                    continue
+                try:
+                    st = e.stat()
+                except OSError:
+                    continue
+                entries.append((m.group(1), e.path, st.st_mtime, st.st_size))
+                total += st.st_size
+    except OSError:
+        return 0
+
+    if total <= max_bytes:
+        return 0
+
+    groups: Dict[str, list] = {}
+    for cid, path, mtime, size in entries:
+        groups.setdefault(cid, []).append((path, mtime, size))
+
+    ordered = sorted(
+        groups.keys(),
+        key=lambda cid: min(m for _, m, _ in groups[cid]),
+    )
+
+    freed = 0
+    for cid in ordered:
+        if total <= target_bytes:
+            break
+        if cid in skip_ids:
+            continue
+        removed = 0
+        for path, _, size in groups[cid]:
+            try:
+                os.remove(path)
+                removed += size
+            except OSError:
+                pass
+        total -= removed
+        freed += removed
+    return freed
+
+
+def is_cache_valid(
+    cache_id: str,
+    require_subtitles: bool = False,
+    require_cues: bool = False,
+) -> bool:
     audio_path = get_audio_path(cache_id)
     if not os.path.exists(audio_path):
         return False
@@ -332,6 +437,11 @@ def is_cache_valid(cache_id: str, require_subtitles: bool = False) -> bool:
         ):
             return False
 
+    # Cues are required for reader auto-scroll (edge + gtts chunk cues).
+    # Old gtts caches generated without cues are considered invalid → tái tạo.
+    if require_cues and not os.path.exists(get_cues_json_path(cache_id)):
+        return False
+
     return True
 
 
@@ -355,6 +465,7 @@ def get_effective_status(cache_id: str) -> Optional[dict]:
         # Infer subtitle support from engine stored in meta
         subtitle_supported = meta.get("subtitle_supported", meta.get("engine") == "edge") if meta else False
         subtitle_ready = meta.get("subtitle_ready", subtitle_supported) if meta else False
+        scroll_supported = meta.get("scroll_supported", meta.get("engine") in {"edge", "gtts"}) if meta else False
         return {
             "status": "completed",
             "progress": 1,
@@ -362,6 +473,7 @@ def get_effective_status(cache_id: str) -> Optional[dict]:
             "file_size": file_size,
             "subtitle_supported": subtitle_supported,
             "subtitle_ready": subtitle_ready,
+            "scroll_supported": scroll_supported,
         }
 
     return None
@@ -621,12 +733,19 @@ def split_long_text_gently(text: str, limit: int) -> List[str]:
     return [c for c in final_chunks if c]
 
 
-def split_text_into_chunks(text: str, language: str = "vi") -> List[str]:
+def split_text_into_chunks(
+    text: str,
+    language: str = "vi",
+    hard_max_override: Optional[int] = None,
+) -> List[str]:
     text = normalize_text(text)
     if not text:
         return []
 
     chunk_sizes, hard_max, max_sentences_profile = get_chunk_profile(language, text)
+    if hard_max_override:
+        hard_max = hard_max_override
+        chunk_sizes = [min(s, hard_max_override) for s in chunk_sizes]
     paragraphs = split_paragraphs(text)
     if not paragraphs:
         return []
@@ -1101,18 +1220,23 @@ async def generate_chunks(
         skipped_chunks = 0
 
         require_subtitles = engine == "edge"
-        if is_cache_valid(cache_id, require_subtitles=require_subtitles):
+        require_cues = engine in {"edge", "gtts"}
+        if is_cache_valid(cache_id, require_subtitles=require_subtitles, require_cues=require_cues):
             generation_status[cache_id] = {
                 "status": "completed",
                 "progress": 1,
                 "total": 1,
                 "subtitle_supported": engine == "edge",
                 "subtitle_ready": engine == "edge",
+                "scroll_supported": True,
             }
             return
 
         if chunks is None:
-            chunks = split_text_into_chunks(text, language=language)
+            if engine == "gtts":
+                chunks = split_text_into_chunks(text, language=language, hard_max_override=GTTS_HARD_MAX_CHUNK)
+            else:
+                chunks = split_text_into_chunks(text, language=language)
 
         if not chunks:
             err = "Text must not be empty"
@@ -1288,6 +1412,7 @@ async def generate_chunks(
                         )
                         continue
 
+                    raw_for_duration = audio
                     if i > 0:
                         audio = strip_id3v2(audio)
 
@@ -1295,8 +1420,28 @@ async def generate_chunks(
                         f.write(audio)
                         f.flush()
 
+                    # Chunk cue: timing thật từ duration MP3 — dùng cho
+                    # "tự cuộn theo đoạn" của khongdich. gTTS không có
+                    # WordBoundary nên granularity = cả chunk; client nội suy
+                    # vị trí theo số ký tự bên trong chunk.
+                    chunk_duration = mp3_duration_seconds(raw_for_duration)
+                    if chunk_duration <= 0:
+                        chunk_duration = 0.05
+
+                    cue_index += 1
+                    cue = {
+                        "start": round(global_audio_sec, 3),
+                        "end": round(global_audio_sec + chunk_duration, 3),
+                        "text": chunk_text,
+                        "index": cue_index,
+                    }
+                    cues_all.append(cue)
+                    append_cues_jsonl(cache_id, [cue])
+                    global_audio_sec += chunk_duration
+
                     current_size = os.path.getsize(audio_path)
                     generation_status[cache_id]["progress"] = i + 1
+                    generation_status[cache_id]["subtitle_cues"] = len(cues_all)
 
                     if (i + 1) % 5 == 0 or i + 1 == total:
                         save_cache_meta(
@@ -1312,7 +1457,8 @@ async def generate_chunks(
                                 "language": language,
                                 "subtitle_supported": False,
                                 "subtitle_ready": False,
-                                "subtitle_cues": 0,
+                                "scroll_supported": True,
+                                "subtitle_cues": len(cues_all),
                             },
                         )
 
@@ -1321,8 +1467,9 @@ async def generate_chunks(
                 raise RuntimeError("Generated audio file is empty")
 
             subtitle_ready = False
-            if engine == "edge":
+            if cues_all:
                 write_json_atomic(get_cues_json_path(cache_id), cues_all)
+            if engine == "edge":
                 write_text_atomic(get_srt_path(cache_id), cues_to_srt(cues_all))
                 write_text_atomic(get_vtt_path(cache_id), cues_to_vtt(cues_all))
                 subtitle_ready = True
@@ -1342,6 +1489,7 @@ async def generate_chunks(
                     "language": language,
                     "subtitle_supported": engine == "edge",
                     "subtitle_ready": subtitle_ready,
+                    "scroll_supported": engine in {"edge", "gtts"},
                     "subtitle_cues": len(cues_all),
                     "duration_seconds": round(global_audio_sec, 3),
                 },
@@ -1356,6 +1504,7 @@ async def generate_chunks(
                     "skipped_chunks": skipped_chunks,
                     "subtitle_supported": engine == "edge",
                     "subtitle_ready": subtitle_ready,
+                    "scroll_supported": engine in {"edge", "gtts"},
                     "subtitle_cues": len(cues_all),
                     "duration_seconds": round(global_audio_sec, 3),
                 }
@@ -1382,6 +1531,20 @@ async def generate_chunks(
             generation_status.pop(cache_id, None)
         finally:
             _generation_locks.pop(cache_id, None)
+            # Chống cache phình vô hạn: xóa cache cũ nhất khi vượt MAX_CACHE_MB.
+            # Chạy trong executor để không chặn event loop.
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    prune_cache_dir,
+                    CACHE_DIR,
+                    MAX_CACHE_MB * 1024 * 1024,
+                    None,
+                    set(generation_status.keys()) | set(_generation_locks.keys()),
+                )
+            except Exception:  # pragma: no cover
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1442,14 +1605,16 @@ async def start_tts(background_tasks: BackgroundTasks, request: TTSRequest):
 
     cache_id = get_cache_id(text, voice, engine, language)
     require_subtitles = engine == "edge"
+    require_cues = engine in {"edge", "gtts"}
 
-    if is_cache_valid(cache_id, require_subtitles=require_subtitles):
+    if is_cache_valid(cache_id, require_subtitles=require_subtitles, require_cues=require_cues):
         return {
             "cache_id": cache_id,
             "status": "completed",
             "url": f"/tts/file/{cache_id}",
             "subtitle_supported": engine == "edge",
             "subtitle_ready": engine == "edge",
+            "scroll_supported": True,
         }
 
     current = get_effective_status(cache_id)
@@ -1459,12 +1624,16 @@ async def start_tts(background_tasks: BackgroundTasks, request: TTSRequest):
             "status": current.get("status"),
             "subtitle_supported": engine == "edge",
             "subtitle_ready": False,
+            "scroll_supported": require_cues,
         }
 
     if os.path.exists(get_audio_path(cache_id)) or os.path.exists(get_meta_path(cache_id)):
         cleanup_incomplete_cache(cache_id)
 
-    chunk_preview = split_text_into_chunks(text, language=language)
+    if engine == "gtts":
+        chunk_preview = split_text_into_chunks(text, language=language, hard_max_override=GTTS_HARD_MAX_CHUNK)
+    else:
+        chunk_preview = split_text_into_chunks(text, language=language)
 
     generation_status[cache_id] = {
         "status": "queued",
@@ -1498,6 +1667,7 @@ async def start_tts(background_tasks: BackgroundTasks, request: TTSRequest):
         "estimated_chunks": len(chunk_preview),
         "subtitle_supported": engine == "edge",
         "subtitle_ready": False,
+        "scroll_supported": engine in {"edge", "gtts"},
     }
 
 
@@ -1521,7 +1691,10 @@ async def regenerate_tts(background_tasks: BackgroundTasks, request: TTSRequest)
     # Also remove from in-memory status
     generation_status.pop(cache_id, None)
 
-    chunk_preview = split_text_into_chunks(text, language=language)
+    if engine == "gtts":
+        chunk_preview = split_text_into_chunks(text, language=language, hard_max_override=GTTS_HARD_MAX_CHUNK)
+    else:
+        chunk_preview = split_text_into_chunks(text, language=language)
 
     generation_status[cache_id] = {
         "status": "queued",
@@ -1556,6 +1729,7 @@ async def regenerate_tts(background_tasks: BackgroundTasks, request: TTSRequest)
         "regenerated": True,
         "subtitle_supported": engine == "edge",
         "subtitle_ready": False,
+        "scroll_supported": engine in {"edge", "gtts"},
     }
 
 
@@ -1636,12 +1810,21 @@ async def get_vtt_file(cache_id: str):
 async def get_cues(cache_id: str):
     cache_id = validate_cache_id(cache_id)
     meta = load_cache_meta(cache_id)
-    if not meta or meta.get("engine") != "edge":
-        return JSONResponse({"cues": [], "done": True, "subtitle_supported": False})
+    engine = meta.get("engine") if meta else None
+    if engine not in {"edge", "gtts"}:
+        return JSONResponse(
+            {"cues": [], "done": True, "subtitle_supported": False, "scroll_supported": False}
+        )
+    subtitle_supported = engine == "edge"
 
     cues = load_cues_json(cache_id)
     if cues:
-        return {"cues": cues, "done": True, "subtitle_supported": True}
+        return {
+            "cues": cues,
+            "done": True,
+            "subtitle_supported": subtitle_supported,
+            "scroll_supported": True,
+        }
 
     jsonl_path = get_cues_jsonl_path(cache_id)
     partial: List[dict] = []
@@ -1662,20 +1845,36 @@ async def get_cues(cache_id: str):
 
     status = get_effective_status(cache_id)
     if status and status.get("status") in {"completed", "failed"}:
-        result: dict = {"cues": partial, "done": True, "subtitle_supported": True}
+        result: dict = {
+            "cues": partial,
+            "done": True,
+            "subtitle_supported": subtitle_supported,
+            "scroll_supported": True,
+        }
         if status.get("status") == "failed":
             result["error"] = status.get("error", "generation failed")
         return result
-    return {"cues": partial, "done": False, "subtitle_supported": True}
+    return {
+        "cues": partial,
+        "done": False,
+        "subtitle_supported": subtitle_supported,
+        "scroll_supported": True,
+    }
 
 
 @app.get("/tts/cues/stream/{cache_id}")
 async def stream_cues_live(cache_id: str, request: Request):
     cache_id = validate_cache_id(cache_id)
     meta = load_cache_meta(cache_id)
-    if not meta or meta.get("engine") != "edge":
+    engine = meta.get("engine") if meta else None
+    subtitle_supported = engine == "edge"
+    scroll_supported = engine in {"edge", "gtts"}
+    if engine not in {"edge", "gtts"}:
         async def empty():
-            payload = json.dumps({"done": True, "subtitle_supported": False}, ensure_ascii=False)
+            payload = json.dumps(
+                {"done": True, "subtitle_supported": False, "scroll_supported": False},
+                ensure_ascii=False,
+            )
             yield f"event: complete\ndata: {payload}\n\n"
 
         return StreamingResponse(
@@ -1776,7 +1975,14 @@ async def stream_cues_live(cache_id: str, request: Request):
                     stable_completed_checks += 1
 
                 if stable_completed_checks >= 2:
-                    payload = json.dumps({"done": True, "subtitle_supported": True}, ensure_ascii=False)
+                    payload = json.dumps(
+                        {
+                            "done": True,
+                            "subtitle_supported": subtitle_supported,
+                            "scroll_supported": scroll_supported,
+                        },
+                        ensure_ascii=False,
+                    )
                     yield f"event: complete\ndata: {payload}\n\n"
                     break
             else:
