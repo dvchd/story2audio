@@ -429,7 +429,9 @@ def is_cache_valid(
     if actual_size <= 0 or actual_size != expected_size:
         return False
 
-    if require_subtitles and meta.get("engine") == "edge":
+    # Cả edge lẫn gtts đều ghi .srt/.vtt lúc hoàn tất — cache thiếu file
+    # (gtts cũ trước khi có phụ đề) coi như chưa sẵn sàng → tái tạo.
+    if require_subtitles and meta.get("engine") in {"edge", "gtts"}:
         if not (
             os.path.exists(get_srt_path(cache_id))
             and os.path.exists(get_vtt_path(cache_id))
@@ -956,6 +958,66 @@ def cues_to_srt(cues: List[dict]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def build_subtitle_cues(
+    cues: List[dict],
+    max_len: int = 160,
+) -> List[dict]:
+    """Chuyển cues thô thành cues phụ đề mức-câu.
+
+    Cue của gTTS = cả một chunk (tới ~1200 ký tự ≈ vài chục giây) — quá
+    dài để làm phụ đề. Hàm chẻ TỪNG CÂU trong chunk rồi chia thời lượng
+    tỷ lệ số ký tự trong khoảng [start, end] thật của chunk; mảnh CUỐI
+    lấy phần dư nên tổng con vẫn khớp chính xác ranh giới chunk. Câu quá
+    dài bị cắt cứng tại `max_len` ký tự (giống client mobile).
+    """
+    out: List[dict] = []
+    index = 0
+    for cue in cues:
+        text = str(cue.get("text", "")).strip()
+        start = float(cue.get("start", 0.0))
+        end = float(cue.get("end", 0.0))
+        dur = max(end - start, 0.0)
+        if not text or dur <= 0:
+            continue
+
+        sentences: List[str] = []
+        for raw in _SENTENCE_SPLIT_RE.split(text):
+            s = raw.strip()
+            if not s:
+                continue
+            while len(s) > max_len:
+                sentences.append(s[:max_len].strip())
+                s = s[max_len:].strip()
+            if s:
+                sentences.append(s)
+        if not sentences:
+            continue
+
+        total_chars = sum(len(s) for s in sentences)
+        cursor = start
+        for j, sentence in enumerate(sentences):
+            is_last = j == len(sentences) - 1
+            piece_end = (
+                end
+                if is_last or total_chars == 0
+                else cursor + dur * len(sentence) / total_chars
+            )
+            index += 1
+            out.append(
+                {
+                    "start": round(cursor, 3),
+                    "end": round(piece_end, 3),
+                    "text": sentence,
+                    "index": index,
+                }
+            )
+            cursor = piece_end
+    return out
+
+
 def cues_to_vtt(cues: List[dict]) -> str:
     lines: List[str] = ["WEBVTT", ""]
     for cue in cues:
@@ -1469,10 +1531,20 @@ async def generate_chunks(
             subtitle_ready = False
             if cues_all:
                 write_json_atomic(get_cues_json_path(cache_id), cues_all)
-            if engine == "edge":
-                write_text_atomic(get_srt_path(cache_id), cues_to_srt(cues_all))
-                write_text_atomic(get_vtt_path(cache_id), cues_to_vtt(cues_all))
-                subtitle_ready = True
+                # File phụ đề (.srt/.vtt) sinh cho CẢ HAI engine: edge dùng
+                # nguyên cues phrase-level; gTTS chẻ câu tỷ lệ ký tự vì cue
+                # của nó = cả chunk (quá dài cho phụ đề). Karaoke trong
+                # reader vẫn chỉ edge (cần word boundary).
+                if engine == "edge":
+                    write_text_atomic(get_srt_path(cache_id), cues_to_srt(cues_all))
+                    write_text_atomic(get_vtt_path(cache_id), cues_to_vtt(cues_all))
+                    subtitle_ready = True
+                elif engine == "gtts":
+                    sub_cues = build_subtitle_cues(cues_all)
+                    if sub_cues:
+                        write_text_atomic(get_srt_path(cache_id), cues_to_srt(sub_cues))
+                        write_text_atomic(get_vtt_path(cache_id), cues_to_vtt(sub_cues))
+                        subtitle_ready = True
 
             final_status = "partial" if skipped_chunks > 0 else "completed"
             save_cache_meta(
@@ -1770,7 +1842,7 @@ async def get_audio_file(cache_id: str, request: Request):
 async def get_srt_file(cache_id: str):
     cache_id = validate_cache_id(cache_id)
     meta = load_cache_meta(cache_id)
-    if not meta or meta.get("engine") != "edge":
+    if not meta or meta.get("engine") not in {"edge", "gtts"}:
         raise HTTPException(status_code=404, detail="Subtitle not found")
 
     if not is_cache_valid(cache_id, require_subtitles=True):
@@ -1790,7 +1862,7 @@ async def get_srt_file(cache_id: str):
 async def get_vtt_file(cache_id: str):
     cache_id = validate_cache_id(cache_id)
     meta = load_cache_meta(cache_id)
-    if not meta or meta.get("engine") != "edge":
+    if not meta or meta.get("engine") not in {"edge", "gtts"}:
         raise HTTPException(status_code=404, detail="Subtitle not found")
 
     if not is_cache_valid(cache_id, require_subtitles=True):

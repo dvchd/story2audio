@@ -4,6 +4,20 @@ Dưới đây là tài liệu tổng hợp lại toàn bộ các tính năng, c�
 
 ---
 
+## [v3.3.0] - Phụ đề SRT cho Google TTS (tải kèm audio)
+
+### ✨ Tính năng mới
+
+- **File phụ đề (.srt/.vtt) cho cả gTTS:**
+  - Trước đây chỉ Edge có file phụ đề. Giờ gTTS cũng được sinh `.srt`/`.vtt` lúc hoàn tất tổng hợp, phục vụ tính năng "Tải SRT" của khongdich (ghép phụ đề với MP3).
+  - Cue gTTS = cả chunk (quá dài cho phụ đề) → `build_subtitle_cues()` chẻ từng câu và chia thời lượng tỷ lệ số ký tự trong khoảng `[start, end]` thật của chunk; mảnh cuối lấy phần dư nên ranh giới chunk vẫn chính xác tuyệt đối. Câu quá dài cắt cứng tại 160 ký tự.
+  - Karaoke trong reader vẫn chỉ dành cho Edge (`subtitle_supported` không đổi — cần word boundary).
+
+- **Endpoint `/tts/subtitle/srt/{cache_id}` và `/tts/subtitle/vtt/{cache_id}` mở cho cả gtts:**
+  - Cache cũ của gTTS (sinh trước v3.3.0, chưa có file phụ đề) trả 404 → khongdich báo user bấm Nghe để tạo lại.
+
+---
+
 ## [v3.2.0] - Chunk cues cho Google TTS (tự cuộn theo đoạn)
 
 ### ✨ Tính năng mới
